@@ -35,12 +35,14 @@ def train_step(params, opt_state, batch, rho, mu, model, optimizer, lambda_cont=
     Returns:
         Updated parameters, optimizer state, loss value, and auxiliary info
     """
+    # Get a reference to the model's apply function (this is hashable)
+    apply_fn = model.apply
     
     def loss_fn(params):
         """Loss function combining momentum and continuity residuals"""
         # Compute residuals for current batch
         x_momentum, y_momentum, continuity = compute_ns_residuals(
-            model, params, batch, rho, mu
+            params, batch, rho, mu, apply_fn=apply_fn
         )
         
         # Compute mean squared residuals

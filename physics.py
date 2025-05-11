@@ -10,26 +10,26 @@ import jax.numpy as jnp
 from typing import Callable, Tuple, Dict, Any, Union
 
 
-def compute_momentum_residual(model, params, x, rho, mu, dim='x'):
+def compute_momentum_residual(params, x, rho, mu, dim='x', apply_fn=None):
     """
     Compute residuals of momentum equation using automatic differentiation.
     
     Args:
-        model: PINN model instance
         params: Model parameters
         x: Input coordinates
         rho: Fluid density
         mu: Dynamic viscosity
         dim: Dimension of momentum equation ('x' or 'y')
+        apply_fn: The model's apply function
     
     Returns:
         Residual of momentum equation in the specified dimension
     """
     
     # Define helper functions for extracting velocity and pressure components
-    def u_fn(x): return model.apply(params, x)[:, 0:1]
-    def v_fn(x): return model.apply(params, x)[:, 1:2]
-    def p_fn(x): return model.apply(params, x)[:, 2:3]
+    def u_fn(x): return apply_fn(params, x)[:, 0:1]
+    def v_fn(x): return apply_fn(params, x)[:, 1:2]
+    def p_fn(x): return apply_fn(params, x)[:, 2:3]
     
     # Compute first-order derivatives
     u_x = jax.jacfwd(u_fn, 0)(x)[:, :, 0]
@@ -58,22 +58,22 @@ def compute_momentum_residual(model, params, x, rho, mu, dim='x'):
     return momentum
 
 
-def compute_continuity_residual(model, params, x):
+def compute_continuity_residual(params, x, apply_fn=None):
     """
     Compute residuals of continuity equation (mass conservation).
     
     Args:
-        model: PINN model instance
         params: Model parameters
         x: Input coordinates
+        apply_fn: The model's apply function
     
     Returns:
         Residual of continuity equation
     """
     
     # Define helper functions for extracting velocity components
-    def u_fn(x): return model.apply(params, x)[:, 0:1]
-    def v_fn(x): return model.apply(params, x)[:, 1:2]
+    def u_fn(x): return apply_fn(params, x)[:, 0:1]
+    def v_fn(x): return apply_fn(params, x)[:, 1:2]
     
     # Compute derivatives
     u_x = jax.jacfwd(u_fn, 0)(x)[:, :, 0]
@@ -85,23 +85,23 @@ def compute_continuity_residual(model, params, x):
     return continuity
 
 
-def compute_ns_residuals(model, params, x, rho, mu):
+def compute_ns_residuals(params, x, rho, mu, apply_fn=None):
     """
     Compute all Navier-Stokes residuals for a batch of points.
     
     Args:
-        model: PINN model instance
         params: Model parameters
         x: Batch of input coordinates
         rho: Fluid density
         mu: Dynamic viscosity
+        apply_fn: The model's apply function
     
     Returns:
         Tuple of (x_momentum_residual, y_momentum_residual, continuity_residual)
     """
-    x_momentum = compute_momentum_residual(model, params, x, rho, mu, dim='x')
-    y_momentum = compute_momentum_residual(model, params, x, rho, mu, dim='y')
-    continuity = compute_continuity_residual(model, params, x)
+    x_momentum = compute_momentum_residual(params, x, rho, mu, dim='x', apply_fn=apply_fn)
+    y_momentum = compute_momentum_residual(params, x, rho, mu, dim='y', apply_fn=apply_fn)
+    continuity = compute_continuity_residual(params, x, apply_fn=apply_fn)
     
     return x_momentum, y_momentum, continuity
 
