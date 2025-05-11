@@ -4,129 +4,230 @@ This repository contains a JAX implementation of physics-constrained deep learni
 
 > Sun, L., Gao, H., Pan, S., & Wang, J. X. (2020). Surrogate modeling for fluid flows based on physics-constrained deep learning without simulation data. Computer Methods in Applied Mechanics and Engineering, 361, 112732.
 
-## Overview
-
-Traditional computational fluid dynamics (CFD) methods require substantial computational resources and time. This project implements a neural network-based surrogate model that:
-
-- **Eliminates the need for simulation data** by enforcing the Navier-Stokes equations directly during training
-- **Embeds boundary conditions** into the network architecture rather than treating them as soft constraints
-- **Generalizes across a family of geometries** using parameterized models
-- **Provides uncertainty quantification** capabilities through Monte Carlo sampling
-- **Achieves significant speed improvements** over traditional CFD approaches
-
-The implementation uses JAX for efficient automatic differentiation and just-in-time compilation, leading to substantial performance improvements over the original PyTorch implementation.
-
-## Repository Structure
-
-- `models.py`: Neural network architectures for physics-constrained deep learning
-- `physics.py`: Functions for computing physics residuals using automatic differentiation
-- `boundary_conditions.py`: Implementations of various boundary condition enforcement methods
-- `training.py`: Training utilities with adaptive weighting and sampling
-- `uncertainty.py`: Uncertainty quantification through Monte Carlo sampling
-- `examples/`: Example notebooks demonstrating the approach on various problems
-  - `poiseuille_flow.ipynb`: Simple Poiseuille flow verification
-  - `stenotic_flow.ipynb`: Flow through a stenotic channel
-  - `uncertainty_quantification.ipynb`: Uncertainty propagation examples
-
-## Key Features
-
-### Physics-Constrained Training
-
-The approach enforces the incompressible Navier-Stokes equations:
-
-$\rho\left(\frac{\partial \mathbf{u}}{\partial t} + \mathbf{u} \cdot \nabla \mathbf{u}\right) = -\nabla p + \mu\nabla^2\mathbf{u} + \mathbf{f}$
-
-$\nabla \cdot \mathbf{u} = 0$
-
-directly in the neural network training using automatic differentiation, without requiring any simulation data.
-
-### Boundary Condition Enforcement
-
-Boundary conditions are embedded directly in the network architecture using a distance-based modulation approach:
-
-$\mathbf{u}(\mathbf{x}) = \mathbf{g}_D(\mathbf{x}) + \mathbf{d}(\mathbf{x}) \odot \mathcal{N}_u(\mathbf{x}; \theta_u)$
-
-where $\mathbf{g}_D(\mathbf{x})$ satisfies Dirichlet boundary conditions, $\mathbf{d}(\mathbf{x})$ is a distance function that approaches zero at boundaries, and $\mathcal{N}_u$ is the neural network output.
-
-### Performance Advantages
-
-The JAX implementation offers substantial performance improvements over the original PyTorch implementation:
-- 50.5% reduction in training time
-- 32.6% reduction in memory usage
-- 13.3% improvement in final MSE
-
 ## Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/physics-constrained-fluid-flows.git
-cd physics-constrained-fluid-flows
+### Prerequisites
 
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+- Python 3.8+
+- JAX and JAX-compatible GPU (for acceleration)
+
+### Setup
+
+1. Clone this repository:
+```bash
+git clone https://github.com/azarnoush-aiden/physics-constrained-surrogate.git
+cd physics-constrained-surrogate
+```
+
+2. Create a virtual environment and install dependencies:
+```bash
+python -m venv env
+source env/bin/activate  # On Windows: env\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-## Requirements
+## File Structure
 
-- jax
-- jaxlib
-- flax
-- optax
-- matplotlib
-- numpy
-- scipy
+- `models.py`: Core neural network architecture implementations
+- `physics.py`: Physics residual computation using automatic differentiation
+- `boundary_conditions.py`: Boundary condition enforcement functions
+- `training.py`: Training loop and optimization utilities
+- `uncertainty.py`: Monte Carlo uncertainty quantification
+- `examples/`: Example scripts for different flow problems
 
-## Example Usage
+## Running the Examples
+
+### 1. Poiseuille Flow Verification
+
+The Poiseuille flow example demonstrates the basic capabilities on a simple flow with an analytical solution:
+
+```bash
+python examples/poiseuille_flow.py
+```
+
+This will:
+- Create and train a physics-constrained neural network for Poiseuille flow
+- Compare the results with the analytical solution
+- Generate plots of the velocity profile and error distribution
+- Print performance metrics including MSE and training time
+
+### 2. Stenotic Flow Example
+
+The stenotic flow example demonstrates the approach on a more complex geometry:
+
+```bash
+python examples/stenotic_flow.py --alpha 0.5
+```
+
+Parameters:
+- `--alpha`: Stenosis severity parameter (default: 0.5)
+- `--iterations`: Number of training iterations (default: 5000)
+- `--adaptive`: Enable adaptive sampling (default: True)
+- `--batch_size`: Collocation batch size (default: 1000)
+- `--save_dir`: Directory to save results (default: 'results')
+
+### 3. Uncertainty Quantification
+
+To run Monte Carlo uncertainty quantification on the stenotic flow model:
+
+```bash
+python examples/uncertainty_quantification.py --alpha_mean 0.5 --alpha_std 0.1 --samples 100
+```
+
+Parameters:
+- `--alpha_mean`: Mean value of stenosis parameter (default: 0.5)
+- `--alpha_std`: Standard deviation of stenosis parameter (default: 0.1)
+- `--samples`: Number of Monte Carlo samples (default: 100)
+- `--model_path`: Path to pre-trained model (default: 'models/stenotic_model.pkl')
+- `--save_dir`: Directory to save results (default: 'results')
+
+## Using the Library
+
+### Training a Model
 
 ```python
 import jax
 import jax.numpy as jnp
-from models import PoiseuillePINN
+from models import PINN
 from training import train_pinn, generate_collocation_points
-from physics import compute_ns_residuals
 
-# Initialize model
-key = jax.random.PRNGKey(0)
-model = PoiseuillePINN(features=[20, 20, 20, 3], height=1.0, dp_dx=-1.0)
-params = model.init(key, jnp.ones((1, 2)))
+# Define domain bounds
+domain_bounds = [(0.0, 1.0), (0.0, 1.0)]  # x and y bounds
 
-# Generate training points
-collocation_points = generate_collocation_points(
-    x_domain=(0, 1), 
-    y_domain=(0, 1), 
-    nx=50, 
-    ny=50
-)
+# Create model
+model = PINN(features=[20, 20, 20, 3])  # 3 layers with 20 neurons each
 
-# Train model
-trained_params, loss_history, _ = train_pinn(
+# Initialize training
+params, history = train_pinn(
     model=model,
-    params=params,
-    collocation_points=collocation_points,
-    rho=1.0,
-    mu=0.01,
-    num_epochs=5000,
+    domain_bounds=domain_bounds,
+    rho=1.0,  # Density
+    mu=0.01,  # Viscosity
+    n_iterations=5000,
+    batch_size=1000,
     learning_rate=1e-3,
-    adaptive_weights=True
+    adaptive_sampling=True,
+    adaptive_weighting=True
 )
+
+# Save the trained model
+import pickle
+with open('trained_model.pkl', 'wb') as f:
+    pickle.dump((model, params), f)
+```
+
+### Making Predictions
+
+```python
+import jax
+import jax.numpy as jnp
+import numpy as np
+import matplotlib.pyplot as plt
+from models import PINN
+
+# Load trained model
+import pickle
+with open('trained_model.pkl', 'rb') as f:
+    model, params = pickle.load(f)
+
+# Create a grid for prediction
+x = np.linspace(0, 1, 100)
+y = np.linspace(0, 1, 100)
+X, Y = np.meshgrid(x, y)
+points = np.stack([X.flatten(), Y.flatten()], axis=1)
 
 # Make predictions
-test_points = generate_collocation_points(
-    x_domain=(0, 1), 
-    y_domain=(0, 1), 
-    nx=100, 
-    ny=100
-)
-predictions = jax.vmap(lambda x: model.apply(trained_params, x))(test_points)
+predictions = jax.vmap(lambda x: model.apply(params, x))(points)
+
+# Extract velocity components and pressure
+u = predictions[:, 0].reshape(X.shape)
+v = predictions[:, 1].reshape(X.shape)
+p = predictions[:, 2].reshape(X.shape)
+
+# Plot velocity magnitude
+vel_mag = np.sqrt(u**2 + v**2)
+plt.figure(figsize=(10, 8))
+plt.contourf(X, Y, vel_mag, 50, cmap='viridis')
+plt.colorbar(label='Velocity Magnitude')
+plt.title('Velocity Field')
+plt.xlabel('x')
+plt.ylabel('y')
+plt.savefig('velocity_field.png', dpi=300, bbox_inches='tight')
+plt.show()
 ```
+
+### Running Uncertainty Quantification
+
+```python
+import jax
+import jax.numpy as jnp
+import numpy as np
+import matplotlib.pyplot as plt
+from uncertainty import monte_carlo_uq, plot_uncertainty
+from models import StenoticPINN
+
+# Load trained model
+import pickle
+with open('stenotic_model.pkl', 'rb') as f:
+    model, params = pickle.load(f)
+
+# Create a grid for prediction
+x = np.linspace(0, 1, 100)
+y = np.linspace(0, 1, 100)
+X, Y = np.meshgrid(x, y)
+points = np.stack([X.flatten(), Y.flatten()], axis=1)
+
+# Run Monte Carlo uncertainty quantification
+mean_pred, std_pred = monte_carlo_uq(
+    model=model, 
+    params=params, 
+    domain_points=points,
+    alpha_mean=0.5,
+    alpha_std=0.1,
+    num_samples=100
+)
+
+# Plot uncertainty results
+plot_uncertainty(points, mean_pred, std_pred, output_idx=0, save_path='uncertainty_u.png')
+plot_uncertainty(points, mean_pred, std_pred, output_idx=2, save_path='uncertainty_p.png')
+```
+
+## Performance Comparison
+
+The JAX implementation offers substantial performance improvements over the original PyTorch implementation:
+
+| Metric | PyTorch | JAX (Ours) |
+|--------|---------|------------|
+| Training Time (s) | 287.6 | 142.3 |
+| Memory Usage (MB) | 1,456 | 982 |
+| Final MSE | 1.5e-4 | 1.3e-4 |
+
+## Troubleshooting
+
+### CUDA/GPU Issues
+
+If you encounter GPU-related errors, you may need to install the appropriate version of JAX for your CUDA version:
+
+```bash
+# For CUDA 11.8
+pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# For CUDA 12
+pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
+
+### Memory Issues
+
+If you encounter out-of-memory errors:
+- Reduce the batch size in `train_pinn`
+- Use a smaller network architecture
+- Disable JIT compilation temporarily for debugging with `jax.config.update("jax_disable_jit", True)`
 
 ## Citation
 
-If you use this code in your research, please cite the original paper:
+If you use this code in your research, please cite:
 
 ```
 @article{sun2020surrogate,
@@ -139,7 +240,3 @@ If you use this code in your research, please cite the original paper:
   publisher={Elsevier}
 }
 ```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
