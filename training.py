@@ -1,501 +1,474 @@
 """
-Training utilities for physics-constrained neural networks.
+Training implementation for physics-constrained neural networks using JAX.
 
-This module contains functions for training physics-constrained neural networks
-with adaptive loss weighting and collocation point generation.
+This module implements the core training logic using JAX's functional approach
+for physics-constrained deep learning of fluid flows.
 """
 
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import optax
+import numpy as np
 from functools import partial
-from typing import Dict, Tuple, List, Callable, Any, Union
-import time
-
-from physics import compute_ns_residuals, compute_continuity_residual
+from typing import Tuple, List, Dict, Any, Callable, Optional, Union
+from physics import compute_ns_residuals
 
 
-def init_model_params(model, key, input_shape=(1, 2)):
+@jax.jit
+def train_step(params, opt_state, batch, rho, mu, model, optimizer, lambda_cont=1.0):
     """
-    Initialize model parameters.
+    Single training step for physics-constrained neural network.
+    
+    JAX's functional approach means computation of gradients with respect to a pure function
+    and update of parameters using the optimizer's update function.
     
     Args:
-        model: Flax model to initialize
-        key: Random seed key
-        input_shape: Shape of input tensor, default (1, 2) for 2D coordinates
-        
+        params: Current model parameters
+        opt_state: Current optimizer state
+        batch: Batch of collocation points
+        rho: Fluid density
+        mu: Dynamic viscosity
+        model: PINN model instance
+        optimizer: Optax optimizer
+        lambda_cont: Weight for continuity equation residual
+    
     Returns:
-        Initialized parameters
+        Updated parameters, optimizer state, loss value, and auxiliary info
     """
-    dummy_input = jnp.ones(input_shape)  # Batch size 1, 2D coordinates
-    return model.init(key, dummy_input)
+    
+    def loss_fn(params):
+        """Loss function combining momentum and continuity residuals"""
+        # Compute residuals for current batch
+        x_momentum, y_momentum, continuity = compute_ns_residuals(
+            model, params, batch, rho, mu
+        )
+        
+        # Compute mean squared residuals
+        x_momentum_loss = jnp.mean(x_momentum**2)
+        y_momentum_loss = jnp.mean(y_momentum**2)
+        continuity_loss = jnp.mean(continuity**2)
+        
+        # Total loss with weighting
+        total_loss = x_momentum_loss + y_momentum_loss + lambda_cont * continuity_loss
+        
+        return total_loss, (x_momentum_loss, y_momentum_loss, continuity_loss)
+    
+    # Compute loss and gradients using JAX's value_and_grad
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    
+    # Update parameters using optimizer
+    updates, new_opt_state = optimizer.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    
+    return new_params, new_opt_state, loss, aux
 
 
-def generate_collocation_points(x_domain, y_domain, nx=50, ny=50, method='uniform'):
+def adaptive_loss_weights(momentum_grad_norm, continuity_grad_norm, alpha=0.1):
+    """
+    Compute adaptive weights for balancing different loss terms.
+    
+    This function implements the adaptive weighting scheme to balance
+    competing gradient contributions from different physics terms.
+    
+    Args:
+        momentum_grad_norm: Norm of momentum equation gradients
+        continuity_grad_norm: Norm of continuity equation gradients
+        alpha: Adaptation rate parameter
+    
+    Returns:
+        Tuple of (momentum_weight, continuity_weight)
+    """
+    ratio_m = momentum_grad_norm / continuity_grad_norm
+    ratio_c = continuity_grad_norm / momentum_grad_norm
+    
+    # Apply exponential scaling
+    lambda_m = jnp.exp(-alpha * ratio_m)
+    lambda_c = jnp.exp(-alpha * ratio_c)
+    
+    return lambda_m, lambda_c
+
+
+@partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
+def train_step_adaptive(params, opt_state, batch, epoch, rho, mu, model, optimizer, n_adapt):
+    """
+    Training step with adaptive loss weighting.
+    
+    This function implements the adaptive training procedure that balances
+    different physics components through dynamic weight adjustment.
+    
+    Args:
+        params: Current model parameters
+        opt_state: Current optimizer state
+        batch: Batch of collocation points
+        epoch: Current training epoch
+        rho: Fluid density
+        mu: Dynamic viscosity
+        model: PINN model instance
+        optimizer: Optax optimizer
+        n_adapt: Interval for weight adaptation
+    
+    Returns:
+        Updated parameters, optimizer state, loss value, weights, and auxiliary info
+    """
+    # Initial weights
+    momentum_weight = 1.0
+    continuity_weight = 1.0
+    
+    # Separate loss functions for computing gradients
+    def momentum_loss_fn(params):
+        x_momentum, y_momentum, _ = compute_ns_residuals(model, params, batch, rho, mu)
+        return jnp.mean(x_momentum**2) + jnp.mean(y_momentum**2)
+    
+    def continuity_loss_fn(params):
+        _, _, continuity = compute_ns_residuals(model, params, batch, rho, mu)
+        return jnp.mean(continuity**2)
+    
+    # Combined loss for training
+    def total_loss_fn(params):
+        x_momentum, y_momentum, continuity = compute_ns_residuals(model, params, batch, rho, mu)
+        
+        # Compute individual losses
+        x_momentum_loss = jnp.mean(x_momentum**2)
+        y_momentum_loss = jnp.mean(y_momentum**2)
+        continuity_loss = jnp.mean(continuity**2)
+        
+        # Total loss with weighting
+        momentum_loss = x_momentum_loss + y_momentum_loss
+        total_loss = momentum_weight * momentum_loss + continuity_weight * continuity_loss
+        
+        return total_loss, (momentum_loss, continuity_loss)
+    
+    # Adapt weights every n_adapt epochs
+    do_adapt = (epoch % n_adapt == 0)
+    
+    def adapt_weights():
+        # Compute gradient norms
+        momentum_grad = jax.grad(momentum_loss_fn)(params)
+        continuity_grad = jax.grad(continuity_loss_fn)(params)
+        
+        # Compute L2 norms
+        momentum_grad_norm = optax.global_norm(momentum_grad)
+        continuity_grad_norm = optax.global_norm(continuity_grad)
+        
+        # Update weights
+        new_momentum_weight, new_continuity_weight = adaptive_loss_weights(
+            momentum_grad_norm, continuity_grad_norm
+        )
+        
+        return new_momentum_weight, new_continuity_weight
+    
+    # Only adapt weights periodically
+    momentum_weight, continuity_weight = jax.lax.cond(
+        do_adapt,
+        lambda _: adapt_weights(),
+        lambda _: (momentum_weight, continuity_weight),
+        operand=None
+    )
+    
+    # Compute loss and gradients
+    (loss, aux), grads = jax.value_and_grad(total_loss_fn, has_aux=True)(params)
+    
+    # Update parameters using optimizer
+    updates, new_opt_state = optimizer.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    
+    return new_params, new_opt_state, loss, (momentum_weight, continuity_weight), aux
+
+
+def generate_collocation_points(domain_bounds, n_points, adaptive=False, boundary_ratio=0.2):
     """
     Generate collocation points for training.
     
     Args:
-        x_domain: Tuple of (x_min, x_max)
-        y_domain: Tuple of (y_min, y_max)
-        nx: Number of points in x direction
-        ny: Number of points in y direction
-        method: Sampling method ('uniform', 'random', 'lhs', 'adaptive')
-        
+        domain_bounds: List of (min, max) tuples for each dimension
+        n_points: Total number of points to generate
+        adaptive: Whether to use adaptive sampling (higher density near boundaries)
+        boundary_ratio: Ratio of points to allocate near boundaries if adaptive is True
+    
     Returns:
-        Array of collocation points with shape (nx*ny, 2)
+        Array of collocation points
     """
-    x_min, x_max = x_domain
-    y_min, y_max = y_domain
-    
-    if method == 'uniform':
-        # Uniform grid
-        x = jnp.linspace(x_min, x_max, nx)
-        y = jnp.linspace(y_min, y_max, ny)
-        X, Y = jnp.meshgrid(x, y)
-        return jnp.column_stack([X.flatten(), Y.flatten()])
-    
-    elif method == 'random':
-        # Random sampling
-        key = jax.random.PRNGKey(0)
-        key, subkey = jax.random.split(key)
-        x = jax.random.uniform(key, (nx * ny,), minval=x_min, maxval=x_max)
-        y = jax.random.uniform(subkey, (nx * ny,), minval=y_min, maxval=y_max)
-        return jnp.column_stack([x, y])
-    
-    elif method == 'lhs':
-        # Latin Hypercube Sampling
-        try:
-            from scipy.stats import qmc
-            
-            sampler = qmc.LatinHypercube(d=2, seed=0)
-            sample = sampler.random(n=nx * ny)
-            
-            # Scale samples to the domain
-            x = x_min + (x_max - x_min) * sample[:, 0]
-            y = y_min + (y_max - y_min) * sample[:, 1]
-            
-            return jnp.column_stack([x, y])
-        except ImportError:
-            print("SciPy not available, falling back to uniform sampling")
-            return generate_collocation_points(x_domain, y_domain, nx, ny, 'uniform')
-    
+    if not adaptive:
+        # Uniform sampling across domain
+        points = []
+        for dim_bounds in domain_bounds:
+            dim_min, dim_max = dim_bounds
+            points.append(np.random.uniform(dim_min, dim_max, n_points))
+        
+        return np.stack(points, axis=1)
     else:
-        # Default to uniform if method not recognized
-        return generate_collocation_points(x_domain, y_domain, nx, ny, 'uniform')
+        # Adaptive sampling with higher density near boundaries
+        n_boundary = int(n_points * boundary_ratio)
+        n_interior = n_points - n_boundary
+        
+        # Interior points (uniform sampling)
+        interior_points = []
+        for dim_bounds in domain_bounds:
+            dim_min, dim_max = dim_bounds
+            interior_points.append(np.random.uniform(dim_min, dim_max, n_interior))
+        
+        interior_points = np.stack(interior_points, axis=1)
+        
+        # Boundary points (closer to domain boundaries)
+        boundary_points = []
+        for i, dim_bounds in enumerate(domain_bounds):
+            dim_min, dim_max = dim_bounds
+            
+            # Points for this dimension's boundaries
+            dim_boundary_pts = np.random.uniform(dim_min, dim_max, n_boundary)
+            
+            # Other dimensions (uniform sampling)
+            other_dims = []
+            for j, other_bounds in enumerate(domain_bounds):
+                if i == j:
+                    # Randomly choose near min or max boundary
+                    near_min = np.random.rand(n_boundary) < 0.5
+                    
+                    # Add small offset from boundaries
+                    epsilon = 0.02 * (dim_max - dim_min)
+                    boundary_vals = np.where(
+                        near_min,
+                        dim_min + epsilon * np.random.rand(n_boundary),
+                        dim_max - epsilon * np.random.rand(n_boundary)
+                    )
+                    other_dims.append(boundary_vals)
+                else:
+                    other_min, other_max = other_bounds
+                    other_dims.append(np.random.uniform(other_min, other_max, n_boundary))
+            
+            boundary_points.append(np.stack(other_dims, axis=1))
+        
+        # Combine all boundary points
+        all_boundary_points = np.vstack(boundary_points)
+        
+        # Randomly select n_boundary points from all boundary points
+        idx = np.random.choice(len(all_boundary_points), n_boundary, replace=False)
+        selected_boundary_points = all_boundary_points[idx]
+        
+        # Combine interior and boundary points
+        all_points = np.vstack([interior_points, selected_boundary_points])
+        
+        # Shuffle points
+        np.random.shuffle(all_points)
+        
+        return all_points
 
 
-def generate_adaptive_points(model, params, domain_points, residual_fn, n_points=1000):
+def generate_collocation_points_stenotic(n_points, alpha=0.5, adaptive=True):
     """
-    Generate adaptive sampling points based on residual magnitude.
+    Generate collocation points specifically for stenotic channel geometry.
     
     Args:
-        model: Neural network model
-        params: Model parameters
-        domain_points: Initial domain sampling points
-        residual_fn: Function to compute residuals
-        n_points: Number of adaptive points to generate
-        
+        n_points: Total number of points to generate
+        alpha: Stenosis severity parameter
+        adaptive: Whether to use adaptive sampling (higher density near stenosis)
+    
     Returns:
-        Array of adaptively sampled points
+        Array of collocation points
     """
-    # Compute residuals on domain points
-    residuals = residual_fn(model, params, domain_points)
+    # Domain bounds for stenotic channel
+    x_range = (0.0, 1.0)
+    y_range = (0.0, 1.0)
     
-    # Convert to scalar residual magnitude (if residuals is a tuple)
-    if isinstance(residuals, tuple):
-        residual_mags = jnp.zeros(domain_points.shape[0])
-        for res in residuals:
-            residual_mags += jnp.abs(res.flatten())**2
-        residual_mags = jnp.sqrt(residual_mags)
-    else:
-        residual_mags = jnp.abs(residuals.flatten())
+    # Basic uniform sampling
+    x = np.random.uniform(x_range[0], x_range[1], n_points)
+    y = np.random.uniform(y_range[0], y_range[1], n_points)
     
-    # Create distribution based on residual magnitudes
-    residual_probs = residual_mags / jnp.sum(residual_mags)
+    if adaptive:
+        # Concentrate more points near the stenosis region (x=0.5)
+        stenosis_center = 0.5
+        stenosis_width = 0.2
+        
+        # Generate more points around stenosis
+        ratio_near_stenosis = 0.6  # 60% of points near stenosis
+        n_stenosis = int(n_points * ratio_near_stenosis)
+        n_uniform = n_points - n_stenosis
+        
+        # Uniform points
+        x_uniform = np.random.uniform(x_range[0], x_range[1], n_uniform)
+        y_uniform = np.random.uniform(y_range[0], y_range[1], n_uniform)
+        
+        # Points concentrated near stenosis
+        x_stenosis = np.random.normal(stenosis_center, stenosis_width/2, n_stenosis)
+        x_stenosis = np.clip(x_stenosis, x_range[0], x_range[1])
+        
+        # Upper boundary with Gaussian constriction
+        def y_upper(x):
+            return 1.0 - alpha * np.exp(-50.0 * (x - 0.5)**2)
+        
+        # Generate points near the boundary with higher probability
+        y_stenosis = []
+        for x_i in x_stenosis:
+            upper = y_upper(x_i)
+            
+            # 70% chance to be in the upper half (including near stenosis)
+            if np.random.rand() < 0.7:
+                # Distribute points in upper half with higher density near stenosis
+                if np.random.rand() < 0.7:
+                    # Very close to stenosis boundary
+                    margin = 0.1 * upper
+                    y_i = upper - margin * np.random.rand()
+                else:
+                    # Upper half but not necessarily near boundary
+                    y_i = 0.5 + 0.5 * upper * np.random.rand()
+            else:
+                # Lower half
+                y_i = np.random.uniform(0, 0.5)
+            
+            y_stenosis.append(y_i)
+        
+        y_stenosis = np.array(y_stenosis)
+        
+        # Combine and shuffle all points
+        x = np.concatenate([x_uniform, x_stenosis])
+        y = np.concatenate([y_uniform, y_stenosis])
+        
+        # Check points outside the domain and fix them
+        for i in range(len(x)):
+            y_top = y_upper(x[i])
+            if y[i] > y_top:
+                y[i] = y_top - 0.01 * np.random.rand()
     
-    # Sample points based on this distribution
-    key = jax.random.PRNGKey(0)
-    indices = jax.random.choice(key, len(domain_points), shape=(n_points,), p=residual_probs)
-    sampled_points = domain_points[indices]
+    # Remove points outside the geometry
+    valid_points = []
+    for i in range(len(x)):
+        # Upper boundary with Gaussian constriction
+        y_top = 1.0 - alpha * np.exp(-50.0 * (x[i] - 0.5)**2)
+        if 0 <= y[i] <= y_top:
+            valid_points.append([x[i], y[i]])
     
-    # Add small random perturbations
-    key, subkey = jax.random.split(key)
-    noise = jax.random.normal(subkey, sampled_points.shape) * 0.01
-    perturbed_points = sampled_points + noise
+    # If we lost too many points, add more
+    valid_points = np.array(valid_points)
+    if len(valid_points) < n_points:
+        # Generate more points and filter again
+        n_additional = 2 * (n_points - len(valid_points))  # Generate extra to account for filtering
+        x_add = np.random.uniform(x_range[0], x_range[1], n_additional)
+        y_add = np.random.uniform(y_range[0], y_range[1], n_additional)
+        
+        for i in range(len(x_add)):
+            y_top = 1.0 - alpha * np.exp(-50.0 * (x_add[i] - 0.5)**2)
+            if 0 <= y_add[i] <= y_top:
+                valid_points = np.vstack([valid_points, [x_add[i], y_add[i]]])
+                if len(valid_points) >= n_points:
+                    break
     
-    return perturbed_points
+    # Trim or pad to exactly n_points
+    if len(valid_points) > n_points:
+        indices = np.random.choice(len(valid_points), n_points, replace=False)
+        valid_points = valid_points[indices]
+    elif len(valid_points) < n_points:
+        # If still too few points, duplicate some
+        n_missing = n_points - len(valid_points)
+        indices = np.random.choice(len(valid_points), n_missing, replace=True)
+        extra_points = valid_points[indices]
+        valid_points = np.vstack([valid_points, extra_points])
+    
+    return valid_points
 
 
-def compute_loss(model, params, batch, rho, mu, loss_weights):
+def initialize_training(model, seed=0, learning_rate=1e-3):
     """
-    Compute loss function for physics-constrained neural network.
+    Initialize model parameters and optimizer for training.
     
     Args:
-        model: Neural network model
-        params: Model parameters
-        batch: Batch of collocation points
-        rho: Fluid density
-        mu: Dynamic viscosity
-        loss_weights: Dictionary of weights for loss components
-        
+        model: PINN model instance
+        seed: Random seed for initialization
+        learning_rate: Initial learning rate for optimizer
+    
     Returns:
-        Tuple of (total_loss, loss_components)
+        Tuple of (initial_params, optimizer, opt_state)
     """
-    # Compute residuals
-    x_momentum, y_momentum, continuity = compute_ns_residuals(model, params, batch, rho, mu)
+    # Initialize parameters
+    key = jax.random.PRNGKey(seed)
+    dummy_input = jnp.ones((1, 2))  # Assuming 2D input (x, y)
+    params = model.init(key, dummy_input)
     
-    # Compute individual loss terms
-    x_momentum_loss = jnp.mean(x_momentum**2)
-    y_momentum_loss = jnp.mean(y_momentum**2)
-    continuity_loss = jnp.mean(continuity**2)
-    
-    # Apply weights to each loss component
-    weighted_x_momentum = loss_weights['x_momentum'] * x_momentum_loss
-    weighted_y_momentum = loss_weights['y_momentum'] * y_momentum_loss
-    weighted_continuity = loss_weights['continuity'] * continuity_loss
-    
-    # Compute total loss
-    total_loss = weighted_x_momentum + weighted_y_momentum + weighted_continuity
-    
-    # Return total loss and components for logging
-    loss_components = {
-        'x_momentum': x_momentum_loss,
-        'y_momentum': y_momentum_loss,
-        'continuity': continuity_loss,
-        'total': total_loss
-    }
-    
-    return total_loss, loss_components
-
-
-def update_loss_weights(loss_components, current_weights, scale=0.1, method='exp_scaling'):
-    """
-    Update loss weights adaptively based on current loss components.
-    
-    Args:
-        loss_components: Dictionary of current loss values
-        current_weights: Dictionary of current weights
-        scale: Scaling factor for weight updates
-        method: Method for weight adaptation ('exp_scaling' or 'inverse')
-        
-    Returns:
-        Updated weights dictionary
-    """
-    if method == 'exp_scaling':
-        # Exponential scaling based on loss magnitudes
-        max_loss = max(loss_components['x_momentum'],
-                       loss_components['y_momentum'],
-                       loss_components['continuity'])
-        
-        new_weights = {
-            'x_momentum': current_weights['x_momentum'] * jnp.exp(scale * (max_loss / (loss_components['x_momentum'] + 1e-8) - 1)),
-            'y_momentum': current_weights['y_momentum'] * jnp.exp(scale * (max_loss / (loss_components['y_momentum'] + 1e-8) - 1)),
-            'continuity': current_weights['continuity'] * jnp.exp(scale * (max_loss / (loss_components['continuity'] + 1e-8) - 1))
-        }
-        
-    elif method == 'inverse':
-        # Inverse proportional scaling
-        total_loss = loss_components['x_momentum'] + loss_components['y_momentum'] + loss_components['continuity']
-        
-        new_weights = {
-            'x_momentum': 1.0 / (loss_components['x_momentum'] / total_loss + 1e-8),
-            'y_momentum': 1.0 / (loss_components['y_momentum'] / total_loss + 1e-8),
-            'continuity': 1.0 / (loss_components['continuity'] / total_loss + 1e-8)
-        }
-        
-        # Normalize weights
-        sum_weights = sum(new_weights.values())
-        for k in new_weights:
-            new_weights[k] = new_weights[k] / sum_weights * 3.0  # Scale to have average of 1.0
-    
-    else:
-        # Default: keep weights the same
-        new_weights = current_weights.copy()
-    
-    return new_weights
-
-
-@partial(jax.jit, static_argnums=(0,))
-def train_step(model, params, batch, rho, mu, loss_weights, optimizer, opt_state):
-    """
-    Execute a single training step.
-    
-    Args:
-        model: Neural network model
-        params: Current model parameters
-        batch: Batch of training points
-        rho: Fluid density
-        mu: Dynamic viscosity
-        loss_weights: Dictionary of weights for loss components
-        optimizer: Optax optimizer
-        opt_state: Optimizer state
-        
-    Returns:
-        Tuple of (new_params, new_opt_state, loss, loss_components)
-    """
-    # Define loss function for this step
-    def loss_fn(p):
-        loss, components = compute_loss(model, p, batch, rho, mu, loss_weights)
-        return loss, components
-    
-    # Compute gradients
-    (loss, loss_components), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-    
-    # Update parameters
-    updates, new_opt_state = optimizer.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    
-    return new_params, new_opt_state, loss, loss_components
-
-
-def train_pinn(model, params, collocation_points, rho, mu, num_epochs=10000, 
-              batch_size=1000, learning_rate=1e-3, adaptive_weights=True,
-              adaptive_sampling=False, adaptive_frequency=500,
-              log_frequency=100, callback=None):
-    """
-    Train a physics-constrained neural network.
-    
-    Args:
-        model: Neural network model
-        params: Initial model parameters
-        collocation_points: Training collocation points
-        rho: Fluid density
-        mu: Dynamic viscosity
-        num_epochs: Number of training epochs
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-        adaptive_weights: Whether to use adaptive loss weights
-        adaptive_sampling: Whether to use adaptive sampling
-        adaptive_frequency: Frequency of adaptive updates
-        log_frequency: How often to log progress
-        callback: Optional callback function for monitoring
-        
-    Returns:
-        Tuple of (trained_params, loss_history, weights_history)
-    """
-    # Set up optimizer
+    # Create optimizer
     optimizer = optax.adam(learning_rate)
     opt_state = optimizer.init(params)
     
-    # Initialize loss weights
-    loss_weights = {
-        'x_momentum': 1.0,
-        'y_momentum': 1.0,
-        'continuity': 1.0
-    }
-    
-    # Prepare training data
-    n_samples = collocation_points.shape[0]
-    n_batches = n_samples // batch_size
-    
-    # Initialize tracking variables
-    loss_history = []
-    weights_history = []
-    
-    print(f"Starting training with {n_samples} points, {n_batches} batches per epoch")
-    start_time = time.time()
-    
-    for epoch in range(num_epochs):
-        # Shuffle points for this epoch
-        key = jax.random.PRNGKey(epoch)
-        perm = jax.random.permutation(key, n_samples)
-        shuffled_points = collocation_points[perm]
-        
-        # Process each batch
-        epoch_loss = 0.0
-        for batch_idx in range(n_batches):
-            # Get batch
-            start_idx = batch_idx * batch_size
-            end_idx = start_idx + batch_size
-            batch = shuffled_points[start_idx:end_idx]
-            
-            # Train on this batch
-            params, opt_state, loss, loss_components = train_step(
-                model, params, batch, rho, mu, loss_weights, optimizer, opt_state
-            )
-            
-            epoch_loss += loss / n_batches
-        
-        # Adaptive weight updating
-        if adaptive_weights and epoch % adaptive_frequency == 0 and epoch > 0:
-            # Compute loss components on full dataset
-            _, full_loss_components = compute_loss(model, params, collocation_points, rho, mu, loss_weights)
-            
-            # Update weights
-            loss_weights = update_loss_weights(full_loss_components, loss_weights)
-            weights_history.append((epoch, loss_weights.copy()))
-        
-        # Adaptive sampling
-        if adaptive_sampling and epoch % adaptive_frequency == 0 and epoch > 0:
-            # Generate new points with higher density in regions with large residuals
-            new_points = generate_adaptive_points(
-                model, params, collocation_points, 
-                lambda m, p, x: compute_ns_residuals(m, p, x, rho, mu),
-                n_points=n_samples // 2
-            )
-            
-            # Combine with uniform sampling
-            uniform_points = generate_collocation_points(
-                (jnp.min(collocation_points[:, 0]), jnp.max(collocation_points[:, 0])),
-                (jnp.min(collocation_points[:, 1]), jnp.max(collocation_points[:, 1])),
-                nx=int(jnp.sqrt(n_samples // 2)),
-                ny=int(jnp.sqrt(n_samples // 2))
-            )
-            
-            collocation_points = jnp.vstack([new_points, uniform_points])
-            print(f"Updated collocation points at epoch {epoch}")
-        
-        # Logging
-        loss_history.append((epoch, float(epoch_loss)))
-        if epoch % log_frequency == 0:
-            elapsed = time.time() - start_time
-            print(f"Epoch {epoch}/{num_epochs}, Loss: {epoch_loss:.6e}, Time: {elapsed:.2f}s")
-            
-            if callback is not None:
-                callback(epoch, params, loss_history, weights_history)
-    
-    total_time = time.time() - start_time
-    print(f"Training completed in {total_time:.2f}s")
-    
-    return params, loss_history, weights_history
+    return params, optimizer, opt_state
 
 
-def train_parameterized_pinn(model, params, collocation_points, parameter_values, 
-                           rho, mu, num_epochs=10000, batch_size=1000, 
-                           learning_rate=1e-3, **kwargs):
+def train_pinn(
+    model,
+    domain_bounds,
+    rho,
+    mu,
+    n_iterations=5000,
+    batch_size=1000,
+    learning_rate=1e-3,
+    adaptive_sampling=True,
+    adaptive_weighting=True,
+    n_adapt=100,
+    seed=0,
+    callback=None
+):
     """
-    Train a parameterized physics-constrained neural network.
+    Complete training procedure for physics-constrained neural network.
     
     Args:
-        model: Parameterized neural network model
-        params: Initial model parameters
-        collocation_points: Training collocation points
-        parameter_values: List of parameter values to train on
+        model: PINN model instance
+        domain_bounds: List of (min, max) tuples for each dimension
         rho: Fluid density
         mu: Dynamic viscosity
-        num_epochs: Number of training epochs
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-        **kwargs: Additional arguments for train_pinn
+        n_iterations: Total number of training iterations
+        batch_size: Number of collocation points per batch
+        learning_rate: Initial learning rate for optimizer
+        adaptive_sampling: Whether to use adaptive collocation point sampling
+        adaptive_weighting: Whether to use adaptive loss weighting
+        n_adapt: Interval for weight adaptation if adaptive_weighting is True
+        seed: Random seed for initialization
+        callback: Optional callback function for monitoring training progress
         
     Returns:
-        Tuple of (trained_params, loss_history, weights_history)
+        Trained parameters and training history dictionary
     """
-    # Set up optimizer
-    optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(params)
+    # Initialize model and optimizer
+    params, optimizer, opt_state = initialize_training(model, seed, learning_rate)
     
-    # Initialize loss weights
-    loss_weights = {
-        'x_momentum': 1.0,
-        'y_momentum': 1.0,
-        'continuity': 1.0
+    # Initialize weights for adaptive training
+    momentum_weight = 1.0
+    continuity_weight = 1.0
+    
+    # Training history
+    history = {
+        'loss': [],
+        'momentum_loss': [],
+        'continuity_loss': [],
+        'momentum_weight': [],
+        'continuity_weight': []
     }
     
-    # Prepare training data
-    n_samples = collocation_points.shape[0]
-    n_param_values = len(parameter_values)
-    samples_per_param = n_samples // n_param_values
-    
-    # Initialize tracking variables
-    loss_history = []
-    weights_history = []
-    
-    print(f"Starting parameterized training with {n_samples} points, {n_param_values} parameter values")
-    start_time = time.time()
-    
-    for epoch in range(num_epochs):
-        # Shuffle points and parameters for this epoch
-        key = jax.random.PRNGKey(epoch)
-        key, subkey = jax.random.split(key)
-        perm_points = jax.random.permutation(key, n_samples)
-        perm_params = jax.random.permutation(subkey, n_param_values)
+    # Training loop
+    for i in range(n_iterations):
+        # Generate collocation points for this iteration
+        batch = generate_collocation_points(domain_bounds, batch_size, adaptive=adaptive_sampling)
+        batch = jnp.array(batch)
         
-        shuffled_points = collocation_points[perm_points]
-        shuffled_params = jnp.array(parameter_values)[perm_params]
+        # Training step
+        if adaptive_weighting:
+            params, opt_state, loss, weights, aux = train_step_adaptive(
+                params, opt_state, batch, i, rho, mu, model, optimizer, n_adapt
+            )
+            momentum_weight, continuity_weight = weights
+            momentum_loss, continuity_loss = aux
+        else:
+            params, opt_state, loss, aux = train_step(
+                params, opt_state, batch, rho, mu, model, optimizer, lambda_cont=continuity_weight
+            )
+            momentum_loss = (aux[0] + aux[1]) / 2.0  # Average of x and y momentum losses
+            continuity_loss = aux[2]
         
-        # Process batches
-        n_batches = n_samples // batch_size
-        epoch_loss = 0.0
+        # Record history
+        history['loss'].append(float(loss))
+        history['momentum_loss'].append(float(momentum_loss))
+        history['continuity_loss'].append(float(continuity_loss))
+        history['momentum_weight'].append(float(momentum_weight))
+        history['continuity_weight'].append(float(continuity_weight))
         
-        for batch_idx in range(n_batches):
-            # Get batch of points
-            start_idx = batch_idx * batch_size
-            end_idx = start_idx + batch_size
-            batch_points = shuffled_points[start_idx:end_idx]
-            
-            # Get batch of parameters (by cycling through them)
-            batch_size_params = batch_size // n_param_values + 1
-            param_indices = jnp.tile(jnp.arange(n_param_values), batch_size_params)[:batch_size]
-            batch_params = shuffled_params[param_indices]
-            
-            # Define a training step for parameterized model
-            def param_train_step(p):
-                total_loss = 0.0
-                components_sum = {'x_momentum': 0.0, 'y_momentum': 0.0, 'continuity': 0.0, 'total': 0.0}
-                
-                for i in range(batch_points.shape[0]):
-                    pt = batch_points[i:i+1]  # Single point
-                    param = batch_params[i]   # Corresponding parameter
-                    
-                    # Define parameterized loss function
-                    def loss_fn(pt, param):
-                        x_momentum, y_momentum, continuity = compute_ns_residuals(
-                            model, p, pt, rho, mu, param
-                        )
-                        
-                        # Compute loss components
-                        x_momentum_loss = jnp.mean(x_momentum**2)
-                        y_momentum_loss = jnp.mean(y_momentum**2)
-                        continuity_loss = jnp.mean(continuity**2)
-                        
-                        # Apply weights
-                        weighted_x_momentum = loss_weights['x_momentum'] * x_momentum_loss
-                        weighted_y_momentum = loss_weights['y_momentum'] * y_momentum_loss
-                        weighted_continuity = loss_weights['continuity'] * continuity_loss
-                        
-                        # Total loss
-                        loss = weighted_x_momentum + weighted_y_momentum + weighted_continuity
-                        
-                        return loss, {
-                            'x_momentum': x_momentum_loss,
-                            'y_momentum': y_momentum_loss,
-                            'continuity': continuity_loss,
-                            'total': loss
-                        }
-                    
-                    loss, components = loss_fn(pt, param)
-                    total_loss += loss / batch_points.shape[0]
-                    
-                    # Accumulate components
-                    for k in components:
-                        components_sum[k] += components[k] / batch_points.shape[0]
-                
-                return total_loss, components_sum
-            
-            # Compute gradients
-            (loss, components), grads = jax.value_and_grad(param_train_step, has_aux=True)(params)
-            
-            # Update parameters
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            
-            epoch_loss += loss / n_batches
-        
-        # Update weights adaptively if needed
-        if kwargs.get('adaptive_weights', False) and epoch % kwargs.get('adaptive_frequency', 500) == 0 and epoch > 0:
-            # Implement adaptive weight updates (similar to train_pinn)
-            pass
-        
-        # Logging
-        loss_history.append((epoch, float(epoch_loss)))
-        if epoch % kwargs.get('log_frequency', 100) == 0:
-            elapsed = time.time() - start_time
-            print(f"Epoch {epoch}/{num_epochs}, Loss: {epoch_loss:.6e}, Time: {elapsed:.2f}s")
+        # Optional callback for monitoring
+        if callback is not None and i % 100 == 0:
+            callback(i, params, history)
     
-    total_time = time.time() - start_time
-    print(f"Parameterized training completed in {total_time:.2f}s")
-    
-    return params, loss_history, weights_history
+    return params, history
