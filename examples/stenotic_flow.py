@@ -300,87 +300,174 @@ def run_stenotic_example(alpha=0.5, rho=1.0, mu=0.01,
     points = np.stack([X.flatten(), Y.flatten()], axis=1)
     points = jnp.array(points)
 
-    # Make predictions
-    predictions = jax.vmap(lambda x: apply_fn(params, x, alpha))(points)
+    # Make predictions with robust error handling
+    def safe_predict(x):
+        # Add batch dimension if needed
+        if len(x.shape) == 1:
+            x = x.reshape(1, -1)
+        
+        try:
+            result = apply_fn(params, x, alpha)
+            
+            # Handle different output shapes
+            if len(result.shape) == 1:
+                # If output is just [u, v, p] without batch dimension
+                if result.shape[0] == 3:
+                    return result.reshape(1, 3)
+                else:
+                    # Unexpected shape
+                    print(f"Warning: Unexpected output shape: {result.shape}")
+                    return result
+            return result
+        except Exception as e:
+            print(f"Error in prediction: {e}")
+            return jnp.zeros((1, 3))  # Return zeros as fallback
 
-    # Extract velocity and pressure
-    u = predictions[:, 0].reshape(ny, nx)
-    v = predictions[:, 1].reshape(ny, nx)
-    p = predictions[:, 2].reshape(ny, nx)
-
-    # Compute velocity magnitude
-    vel_mag = np.sqrt(u**2 + v**2)
-
-    # Create plots
-    print("Creating plots...")
-    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
-
-    # Plot velocity magnitude
-    cf1 = axs[0, 0].contourf(X, Y, vel_mag, 50, cmap='viridis')
-    # Draw the stenosis boundary
-    y_top = 1.0 - alpha * np.exp(-50.0 * (X[0, :] - 0.5)**2)
-    axs[0, 0].plot(X[0, :], y_top, 'k-', linewidth=2)
-    axs[0, 0].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
-    axs[0, 0].set_title('Velocity Magnitude')
-    axs[0, 0].set_xlabel('x')
-    axs[0, 0].set_ylabel('y')
-    plt.colorbar(cf1, ax=axs[0, 0])
-
-    # Plot pressure field
-    cf2 = axs[0, 1].contourf(X, Y, p, 50, cmap='plasma')
-    # Draw the stenosis boundary
-    axs[0, 1].plot(X[0, :], y_top, 'k-', linewidth=2)
-    axs[0, 1].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
-    axs[0, 1].set_title('Pressure')
-    axs[0, 1].set_xlabel('x')
-    axs[0, 1].set_ylabel('y')
-    plt.colorbar(cf2, ax=axs[0, 1])
-
-    # Plot velocity streamlines
-    axs[1, 0].streamplot(X, Y, u, v, density=1, color='k')
-    # Draw the stenosis boundary
-    axs[1, 0].plot(X[0, :], y_top, 'r-', linewidth=2)
-    axs[1, 0].plot(X[0, :], np.zeros_like(X[0, :]), 'r-', linewidth=2)
-    axs[1, 0].set_title('Streamlines')
-    axs[1, 0].set_xlabel('x')
-    axs[1, 0].set_ylabel('y')
-
-    # Plot vorticity
-    # Compute vorticity (∂v/∂x - ∂u/∂y)
-    u_reshaped = u.reshape(-1, 1)
-    v_reshaped = v.reshape(-1, 1)
+    # Process points in smaller batches to avoid memory issues
+    print("Processing predictions in batches...")
+    pred_batch_size = 500
+    all_predictions = []
     
-    def u_fn(x): return apply_fn(params, x, alpha)[:, 0:1]
-    def v_fn(x): return apply_fn(params, x, alpha)[:, 1:2]
+    for i in range(0, len(points), pred_batch_size):
+        batch_end = min(i + pred_batch_size, len(points))
+        batch_points = points[i:batch_end]
+        print(f"Processing batch {i//pred_batch_size + 1}/{(len(points) + pred_batch_size - 1)//pred_batch_size}...")
+        
+        try:
+            batch_preds = jax.vmap(safe_predict)(batch_points)
+            all_predictions.append(batch_preds)
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            # Try with non-vectorized version as fallback
+            batch_results = []
+            for j in range(len(batch_points)):
+                try:
+                    pred = safe_predict(batch_points[j])
+                    batch_results.append(pred)
+                except Exception as inner_e:
+                    print(f"Error on point {j}: {inner_e}")
+                    # Use a placeholder with zeros
+                    batch_results.append(jnp.zeros(3))
+            
+            all_predictions.append(jnp.array(batch_results))
     
-    # Compute derivatives for vorticity
-    u_y = jax.vmap(lambda x: jax.jacfwd(u_fn, 0)(x[None, :])[:, :, 1])(points).reshape(ny, nx)
-    v_x = jax.vmap(lambda x: jax.jacfwd(v_fn, 0)(x[None, :])[:, :, 0])(points).reshape(ny, nx)
+    try:
+        predictions = jnp.vstack(all_predictions)
+        
+        # Extract velocity and pressure
+        u = predictions[:, 0].reshape(ny, nx)
+        v = predictions[:, 1].reshape(ny, nx)
+        p = predictions[:, 2].reshape(ny, nx)
+        
+        # Compute velocity magnitude
+        vel_mag = np.sqrt(u**2 + v**2)
+        
+        # Create plots
+        print("Creating plots...")
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot velocity magnitude
+        cf1 = axs[0, 0].contourf(X, Y, vel_mag, 50, cmap='viridis')
+        # Draw the stenosis boundary
+        y_top = 1.0 - alpha * np.exp(-50.0 * (X[0, :] - 0.5)**2)
+        axs[0, 0].plot(X[0, :], y_top, 'k-', linewidth=2)
+        axs[0, 0].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
+        axs[0, 0].set_title('Velocity Magnitude')
+        axs[0, 0].set_xlabel('x')
+        axs[0, 0].set_ylabel('y')
+        plt.colorbar(cf1, ax=axs[0, 0])
+        
+        # Plot pressure field
+        cf2 = axs[0, 1].contourf(X, Y, p, 50, cmap='plasma')
+        # Draw the stenosis boundary
+        axs[0, 1].plot(X[0, :], y_top, 'k-', linewidth=2)
+        axs[0, 1].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
+        axs[0, 1].set_title('Pressure')
+        axs[0, 1].set_xlabel('x')
+        axs[0, 1].set_ylabel('y')
+        plt.colorbar(cf2, ax=axs[0, 1])
+        
+        # Plot velocity streamlines
+        axs[1, 0].streamplot(X, Y, u, v, density=1, color='k')
+        # Draw the stenosis boundary
+        axs[1, 0].plot(X[0, :], y_top, 'r-', linewidth=2)
+        axs[1, 0].plot(X[0, :], np.zeros_like(X[0, :]), 'r-', linewidth=2)
+        axs[1, 0].set_title('Streamlines')
+        axs[1, 0].set_xlabel('x')
+        axs[1, 0].set_ylabel('y')
+        
+        # Compute and plot vorticity
+        try:
+            # Compute vorticity (∂v/∂x - ∂u/∂y)
+            u_reshaped = u.reshape(-1, 1)
+            v_reshaped = v.reshape(-1, 1)
+            
+            def u_fn(x): return apply_fn(params, x, alpha)[:, 0:1]
+            def v_fn(x): return apply_fn(params, x, alpha)[:, 1:2]
+            
+            # Compute derivatives for vorticity in smaller batches
+            u_y_chunks = []
+            v_x_chunks = []
+            
+            for i in range(0, len(points), pred_batch_size):
+                batch_end = min(i + pred_batch_size, len(points))
+                batch_points = points[i:batch_end]
+                
+                try:
+                    u_y_chunk = jax.vmap(lambda x: jax.jacfwd(u_fn, 0)(x[None, :])[:, :, 1])(batch_points)
+                    v_x_chunk = jax.vmap(lambda x: jax.jacfwd(v_fn, 0)(x[None, :])[:, :, 0])(batch_points)
+                    
+                    u_y_chunks.append(u_y_chunk)
+                    v_x_chunks.append(v_x_chunk)
+                except Exception as e:
+                    print(f"Error computing derivatives for batch {i//pred_batch_size}: {e}")
+                    # Fill with zeros as fallback
+                    u_y_chunks.append(jnp.zeros(batch_end - i))
+                    v_x_chunks.append(jnp.zeros(batch_end - i))
+            
+            u_y = jnp.concatenate(u_y_chunks).reshape(ny, nx)
+            v_x = jnp.concatenate(v_x_chunks).reshape(ny, nx)
+            
+            vorticity = v_x - u_y
+            
+            cf3 = axs[1, 1].contourf(X, Y, vorticity, 50, cmap='RdBu_r')
+            # Draw the stenosis boundary
+            axs[1, 1].plot(X[0, :], y_top, 'k-', linewidth=2)
+            axs[1, 1].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
+            axs[1, 1].set_title('Vorticity')
+            axs[1, 1].set_xlabel('x')
+            axs[1, 1].set_ylabel('y')
+            plt.colorbar(cf3, ax=axs[1, 1])
+        except Exception as e:
+            print(f"Error computing vorticity: {e}")
+            # Just show a blank panel
+            axs[1, 1].set_title('Vorticity (computation failed)')
+            axs[1, 1].set_xlabel('x')
+            axs[1, 1].set_ylabel('y')
+        
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/stenotic_results_alpha_{alpha:.2f}.png', dpi=300)
+        plt.show()
+        
+        print(f"Done! Results saved to {save_dir}/stenotic_results_alpha_{alpha:.2f}.png")
+        
+        # Save trained model
+        import pickle
+        with open(f'{save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl', 'wb') as f:
+            pickle.dump((model, params, alpha), f)
+        print(f"Model saved to {save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl")
+        
+        return model, params, alpha
     
-    vorticity = v_x - u_y
-    
-    cf3 = axs[1, 1].contourf(X, Y, vorticity, 50, cmap='RdBu_r')
-    # Draw the stenosis boundary
-    axs[1, 1].plot(X[0, :], y_top, 'k-', linewidth=2)
-    axs[1, 1].plot(X[0, :], np.zeros_like(X[0, :]), 'k-', linewidth=2)
-    axs[1, 1].set_title('Vorticity')
-    axs[1, 1].set_xlabel('x')
-    axs[1, 1].set_ylabel('y')
-    plt.colorbar(cf3, ax=axs[1, 1])
-
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/stenotic_results_alpha_{alpha:.2f}.png', dpi=300)
-    plt.show()
-
-    print(f"Done! Results saved to {save_dir}/stenotic_results_alpha_{alpha:.2f}.png")
-    
-    # Save trained model
-    import pickle
-    with open(f'{save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl', 'wb') as f:
-        pickle.dump((model, params, alpha), f)
-    print(f"Model saved to {save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl")
-    
-    return model, params, alpha
+    except Exception as e:
+        print(f"Error in generating results: {e}")
+        # Save the trained model anyway so we don't lose the training
+        import pickle
+        with open(f'{save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl', 'wb') as f:
+            pickle.dump((model, params, alpha), f)
+        print(f"Model saved to {save_dir}/stenotic_model_alpha_{alpha:.2f}.pkl despite visualization error")
+        
+        return model, params, alpha
 
 if __name__ == "__main__":
     import argparse

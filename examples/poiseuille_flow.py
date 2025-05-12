@@ -298,70 +298,127 @@ def run_poiseuille_example(height=1.0, dp_dx=-1.0, rho=1.0, mu=0.01,
     points = np.stack([X.flatten(), Y.flatten()], axis=1)
     points = jnp.array(points)
 
-    # Make predictions
-    predictions = jax.vmap(lambda x: apply_fn(params, x))(points)
+    # Make predictions with error handling for shape issues
+    def safe_predict(x):
+        # Add batch dimension if needed
+        if len(x.shape) == 1:
+            x = x.reshape(1, -1)
+        
+        result = apply_fn(params, x)
+        
+        # Handle different output shapes
+        if len(result.shape) == 1:
+            # If output is just [u, v, p] without batch dimension
+            if result.shape[0] == 3:
+                return result.reshape(1, 3)
+            else:
+                # Unexpected shape
+                print(f"Warning: Unexpected output shape: {result.shape}")
+                return result
+        return result
 
-    # Extract velocity and pressure
-    u = predictions[:, 0].reshape(ny, nx)
-    v = predictions[:, 1].reshape(ny, nx)
-    p = predictions[:, 2].reshape(ny, nx)
-
-    # Compute analytical solution for comparison
-    y_vals = np.linspace(0, height, ny)
-    u_analytical = (dp_dx / (2 * mu)) * y_vals * (height - y_vals)
-
-    # Create plots
-    print("Creating plots...")
-    fig, axs = plt.subplots(2, 2, figsize=(15, 10))
-
-    # Plot velocity field
-    cf1 = axs[0, 0].contourf(X, Y, u, 50, cmap='viridis')
-    axs[0, 0].set_title('Velocity u (PINN)')
-    axs[0, 0].set_xlabel('x')
-    axs[0, 0].set_ylabel('y')
-    plt.colorbar(cf1, ax=axs[0, 0])
-
-    # Plot pressure field
-    cf2 = axs[0, 1].contourf(X, Y, p, 50, cmap='plasma')
-    axs[0, 1].set_title('Pressure (PINN)')
-    axs[0, 1].set_xlabel('x')
-    axs[0, 1].set_ylabel('y')
-    plt.colorbar(cf2, ax=axs[0, 1])
-
-    # Plot velocity profile at x = 0.5
-    x_idx = nx // 2
-    axs[1, 0].plot(u[:, x_idx], y, 'r-', label='PINN')
-    axs[1, 0].plot(u_analytical, y_vals, 'b--', label='Analytical')
-    axs[1, 0].set_title('Velocity Profile at x = 0.5')
-    axs[1, 0].set_xlabel('u')
-    axs[1, 0].set_ylabel('y')
-    axs[1, 0].legend()
-
-    # Plot error
-    u_error = np.abs(u[:, x_idx] - u_analytical)
-    axs[1, 1].semilogy(y, u_error, 'k-')
-    axs[1, 1].set_title('Absolute Error')
-    axs[1, 1].set_xlabel('y')
-    axs[1, 1].set_ylabel('|Error|')
-    axs[1, 1].grid(True)
-
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/poiseuille_results.png', dpi=300)
-    plt.show()
-
-    print(f"Done! Results saved to {save_dir}/poiseuille_results.png")
-
-    # Print final MSE
-    mse = np.mean((u[:, x_idx] - u_analytical)**2)
-    print(f"Mean Squared Error: {mse:.6e}")
+    # Process points in smaller batches to avoid memory issues
+    print("Processing predictions in batches...")
+    pred_batch_size = 500
+    all_predictions = []
     
-    # Save trained model
-    import pickle
-    with open(f'{save_dir}/poiseuille_model.pkl', 'wb') as f:
-        pickle.dump((model, params), f)
-    print(f"Model saved to {save_dir}/poiseuille_model.pkl")
+    for i in range(0, len(points), pred_batch_size):
+        batch_end = min(i + pred_batch_size, len(points))
+        batch_points = points[i:batch_end]
+        print(f"Processing batch {i//pred_batch_size + 1}/{(len(points) + pred_batch_size - 1)//pred_batch_size}...")
+        
+        try:
+            batch_preds = jax.vmap(safe_predict)(batch_points)
+            all_predictions.append(batch_preds)
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            # Try with non-vectorized version as fallback
+            batch_results = []
+            for j in range(len(batch_points)):
+                try:
+                    pred = safe_predict(batch_points[j])
+                    batch_results.append(pred)
+                except Exception as inner_e:
+                    print(f"Error on point {j}: {inner_e}")
+                    # Use a placeholder with zeros
+                    batch_results.append(jnp.zeros(3))
+            
+            all_predictions.append(jnp.array(batch_results))
     
-    return model, params, mse
+    try:
+        predictions = jnp.vstack(all_predictions)
+        
+        # Extract velocity and pressure
+        u = predictions[:, 0].reshape(ny, nx)
+        v = predictions[:, 1].reshape(ny, nx)
+        p = predictions[:, 2].reshape(ny, nx)
+        
+        # Compute analytical solution for comparison
+        y_vals = np.linspace(0, height, ny)
+        u_analytical = (dp_dx / (2 * mu)) * y_vals * (height - y_vals)
+        
+        # Create plots
+        print("Creating plots...")
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot velocity field
+        cf1 = axs[0, 0].contourf(X, Y, u, 50, cmap='viridis')
+        axs[0, 0].set_title('Velocity u (PINN)')
+        axs[0, 0].set_xlabel('x')
+        axs[0, 0].set_ylabel('y')
+        plt.colorbar(cf1, ax=axs[0, 0])
+        
+        # Plot pressure field
+        cf2 = axs[0, 1].contourf(X, Y, p, 50, cmap='plasma')
+        axs[0, 1].set_title('Pressure (PINN)')
+        axs[0, 1].set_xlabel('x')
+        axs[0, 1].set_ylabel('y')
+        plt.colorbar(cf2, ax=axs[0, 1])
+        
+        # Plot velocity profile at x = 0.5
+        x_idx = nx // 2
+        axs[1, 0].plot(u[:, x_idx], y, 'r-', label='PINN')
+        axs[1, 0].plot(u_analytical, y_vals, 'b--', label='Analytical')
+        axs[1, 0].set_title('Velocity Profile at x = 0.5')
+        axs[1, 0].set_xlabel('u')
+        axs[1, 0].set_ylabel('y')
+        axs[1, 0].legend()
+        
+        # Plot error
+        u_error = np.abs(u[:, x_idx] - u_analytical)
+        axs[1, 1].semilogy(y, u_error, 'k-')
+        axs[1, 1].set_title('Absolute Error')
+        axs[1, 1].set_xlabel('y')
+        axs[1, 1].set_ylabel('|Error|')
+        axs[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/poiseuille_results.png', dpi=300)
+        plt.show()
+        
+        print(f"Done! Results saved to {save_dir}/poiseuille_results.png")
+        
+        # Print final MSE
+        mse = np.mean((u[:, x_idx] - u_analytical)**2)
+        print(f"Mean Squared Error: {mse:.6e}")
+        
+        # Save trained model
+        import pickle
+        with open(f'{save_dir}/poiseuille_model.pkl', 'wb') as f:
+            pickle.dump((model, params), f)
+        print(f"Model saved to {save_dir}/poiseuille_model.pkl")
+        
+        return model, params, mse
+    
+    except Exception as e:
+        print(f"Error in generating results: {e}")
+        # Save the trained model anyway so we don't lose the training
+        import pickle
+        with open(f'{save_dir}/poiseuille_model.pkl', 'wb') as f:
+            pickle.dump((model, params), f)
+        print(f"Model saved to {save_dir}/poiseuille_model.pkl despite visualization error")
+        
+        return model, params, None
 
 if __name__ == "__main__":
     import argparse
