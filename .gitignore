@@ -173,4 +173,12 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# VS Code settings
+.vscode/
 .DS_Store
+
+# Ignore all "results" folders anywhere in the repository
+results/
+
+# Ignore all "outputs" folders anywhere in the repository
+outputs/
